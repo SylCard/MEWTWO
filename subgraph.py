@@ -73,9 +73,32 @@ def build_base():
     disable_inplace_relu(m)
     return m
 
-def build_ckpt(ranks:set[int]):
-    base=build_base()
-    return checkpoint_by_rank(symbolic_trace(base), ranks)
+# checkpoint every BasicBlock / Bottleneck -------------------------
+class _CPWrapper(torch.nn.Module):
+    """Lightweight wrapper that runs a sub-module under torch.utils.checkpoint."""
+    def __init__(self, mod):
+        super().__init__()
+        self.mod = mod
+
+    def forward(self, *args, **kwargs):  # noqa: D401
+        return checkpoint(self.mod, *args, **kwargs)
+
+
+def _inject_checkpoint(module: torch.nn.Module):
+    """Recursively replace every residual block with a checkpointed wrapper."""
+    for name, child in list(module.named_children()):
+        if isinstance(child, (torchvision.models.resnet.BasicBlock,
+                              torchvision.models.resnet.Bottleneck)):
+            setattr(module, name, _CPWrapper(child))
+        else:
+            _inject_checkpoint(child)
+
+
+def build_ckpt_all():
+    """Return a ResNet-152 where *every* residual block is checkpointed."""
+    m = build_base()
+    _inject_checkpoint(m)
+    return m
 
 # ───────────────── timeline helper (reuse MemoryProfiler) ─────────
 def generate_memory_timeline(model, batch_size: int, device: torch.device, outfile: str):
@@ -105,7 +128,7 @@ def main():
     p_base=peak_mb(base,16,dev)
     del base; torch.cuda.empty_cache()
 
-    ckpt=build_ckpt(ranks).to(dev).train()
+    ckpt=build_ckpt_all().to(dev).train()
     p_ckpt=peak_mb(ckpt,16,dev)
     del ckpt; torch.cuda.empty_cache()
 
@@ -127,7 +150,7 @@ def main():
         mb_base.append(peak_mb(base,bs,dev))
         del base; torch.cuda.empty_cache()
 
-        ckpt=build_ckpt(ranks).to(dev).train()
+        ckpt=build_ckpt_all().to(dev).train()
         mb_ck.append(peak_mb(ckpt,bs,dev))
         del ckpt; torch.cuda.empty_cache()
 
@@ -143,7 +166,7 @@ def main():
     print("Saved both plots.")
 
     # Produce detailed memory timeline for the checkpointed graph (batch-16)
-    ckpt_timeline = build_ckpt(ranks).to(dev).train()
+    ckpt_timeline = build_ckpt_all().to(dev).train()
     generate_memory_timeline(ckpt_timeline, 16, dev, "checkpoint_memory_profile.png")
     del ckpt_timeline; torch.cuda.empty_cache()
 
