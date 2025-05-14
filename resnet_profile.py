@@ -58,9 +58,9 @@ def monkey_patch_residual_blocks():
         return out
 
     if hasattr(res_mod, "BasicBlock"):
-        res_mod.BasicBlock.forward = MethodType(_basic_forward, res_mod.BasicBlock)
+        res_mod.BasicBlock.forward = _basic_forward
     if hasattr(res_mod, "Bottleneck"):
-        res_mod.Bottleneck.forward = MethodType(_bottle_forward, res_mod.Bottleneck)
+        res_mod.Bottleneck.forward = _bottle_forward
 
 
 def disable_inplace_relu(model: torch.nn.Module):
@@ -252,6 +252,65 @@ def write_dynamic_csv(prof: MemoryProfiler, csv_path: str):
             })
 
 
+def plot_peak_memory_vs_batch(
+        model_name: str,
+        batch_sizes: list[int],
+        image_size: int,
+        device: torch.device,
+        patch_residual: bool,
+        no_inplace_relu: bool,
+        output_file: str,
+    ):
+    """Profile *peak* GPU memory for several batch sizes and create a bar plot.
+
+    Args:
+        model_name: Name of the torchvision ResNet variant.
+        batch_sizes: Batch sizes to evaluate (e.g., [8, 16, 32]).
+        image_size: Input resolution for the synthetic images.
+        device: CUDA device for profiling.
+        patch_residual: Whether to replace in-place residual adds.
+        no_inplace_relu: Whether to make all ReLUs out-of-place.
+        output_file: File name for the generated PNG figure.
+    """
+    # Ensure consistent visual style
+    plt.style.use("seaborn-v0_8-whitegrid")
+
+    peak_mb: list[float] = []
+    for bs in batch_sizes:
+        # Fresh model instance each run to avoid state carry-over
+        model = getattr(torchvision.models, model_name)()
+        if patch_residual:
+            monkey_patch_residual_blocks()
+        if no_inplace_relu:
+            disable_inplace_relu(model)
+
+        # Reset CUDA state for a clean measurement
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+
+        _ = profile_resnet_memory(model, batch_size=bs, image_size=image_size, device=device)
+        peak = torch.cuda.max_memory_allocated(device) / 2**20  # MB
+        peak_mb.append(peak)
+
+    # --- Plot -----------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(6, 4))
+    x_labels = [str(b) for b in batch_sizes]
+    bars = ax.bar(x_labels, peak_mb, color="#69b3a2", edgecolor="black")
+    ax.set_xlabel("Batch Size")
+    ax.set_ylabel("Peak GPU Memory (MB)")
+    ax.set_title(f"Peak Memory vs. Batch Size — {model_name}")
+
+    # Annotate bars with exact values
+    for rect, value in zip(bars, peak_mb):
+        height = rect.get_height()
+        ax.text(rect.get_x() + rect.get_width() / 2.0, height + 1, f"{value:.0f}",
+                ha="center", va="bottom", fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig(output_file)
+    plt.close()
+
+
 # ──────────────────────────────────────────────────────────────────────────
 #  Main CLI
 # ──────────────────────────────────────────────────────────────────────────
@@ -264,6 +323,8 @@ def main():
     parser.add_argument("--no-inplace-relu", action="store_true", help="Make all ReLUs out-of-place")
     parser.add_argument("--plot", default="memory_profile.png")
     parser.add_argument("--csv", default="dynamic_profiling.csv")
+    parser.add_argument("--peak-batch-sizes", default="", help="Comma-separated batch sizes for peak memory bar chart (e.g., 8,16,32)")
+    parser.add_argument("--peak-plot", default="peak_vs_batch.png", help="Filename for the peak memory bar figure")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -296,6 +357,23 @@ def main():
     print(f"Peak GPU memory: {peak_total_MB:.1f} MB")
     print(f"Plot saved: {args.plot}")
     print(f"CSV  saved: {args.csv}")
+
+    if args.peak_batch_sizes:
+        sizes = [int(s) for s in args.peak_batch_sizes.split(',') if s.strip()]
+    else:
+        sizes = [8, 16, 32]
+
+    # Always generate the peak-vs-batch plot using computed sizes
+    plot_peak_memory_vs_batch(
+        model_name=args.model,
+        batch_sizes=sizes,
+        image_size=args.image_size,
+        device=device,
+        patch_residual=args.patch_residual,
+        no_inplace_relu=args.no_inplace_relu,
+        output_file=args.peak_plot,
+    )
+    print(f"Peak-vs-batch plot saved: {args.peak_plot} (batch sizes: {sizes})")
 
 
 if __name__ == "__main__":
