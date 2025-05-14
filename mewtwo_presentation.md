@@ -197,7 +197,7 @@ Our implementation generates several key visualizations that demonstrate the eff
 - Text shows the percentage reduction (29-39%)
 - Memory savings increase with batch size
 
-#### Memory Timeline with Checkpointing
+#### Memory Timeline with Checkpointing!
 
 ![Optimized Memory Timeline](optimized_memory_profile.png)
 
